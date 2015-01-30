@@ -1,9 +1,17 @@
 from azure import WindowsAzureMissingResourceError
 from azure.storage import BlobService
+from azure.storage import AccessPolicy
+from azure.storage import SharedAccessPolicy
+from azure.storage import SharedAccessSignature 
 
+import hashlib
+from django.core.cache import cache
 from django.core.files.storage import Storage
 from django.conf import settings
+import datetime
 
+import logging
+logger = logging.getLogger(__name__)
 
 class AzureStorage(Storage):
     """
@@ -96,15 +104,18 @@ class AzureStorage(Storage):
         else:
             content_type = mimetypes.guess_type(name)[0]
 
-        if hasattr(content, 'chunks'):
-            content_str = ''.join(chunk for chunk in content.chunks())
-        else:
-            content_str = content.read()
-
         cache_control = self.get_cache_control(self.container, name,
                                                content_type)
 
-        self._get_service().put_blob(self.container, name, content_str,
+        if hasattr(content, 'chunks'):
+            #content_str = ''.join(chunk for chunk in content.chunks())
+            self._get_service().put_block_blob_from_file(self.container, name, content,
+                                     x_ms_blob_content_type=content_type,
+                                     cache_control=cache_control,
+                                     x_ms_blob_cache_control=cache_control)
+        else:
+            content_str = content.read()
+            self._get_service().put_blob(self.container, name, content_str,
                                      x_ms_blob_type="BlockBlob",
                                      x_ms_blob_content_type=content_type,
                                      cache_control=cache_control,
@@ -182,8 +193,40 @@ class AzureStorage(Storage):
         Returns the URL where the contents of the file referenced by name can
         be accessed.
         """
-
-        return '%s/%s' % (self._get_container_url(), name)
+	try:
+	    m = hashlib.sha1()
+            m.update(self.container)
+	    m.update(name)
+            cache_key = m.hexdigest()
+            val = cache.get(cache_key)
+	    if val is None:
+	        logger.info("trying to generate shared access url for %s" % name)
+                accss_plcy = AccessPolicy()
+	        now = datetime.datetime.now()
+                today = now.strftime('%Y-%m-%d')
+	        tomorrow_datetime = now + datetime.timedelta(days=1)
+	        tomorrow = tomorrow_datetime.strftime('%Y-%m-%d')
+                accss_plcy.start = today
+                accss_plcy.expiry = tomorrow
+                accss_plcy.permission = 'r'
+                signed_identifier = None
+     	        sap = SharedAccessPolicy(accss_plcy, signed_identifier)
+	        logger.info("shared access policy created")
+	        signer = SharedAccessSignature(account_name = self.account_name, account_key=self.account_key)
+       	        logger.info("signed created")
+	        qry_str = signer.generate_signed_query_string("%s/%s" % (self.container, name), 'b', sap)
+	        logger.info("signed query string created")
+	        val = '%s/%s?%s' % (self._get_container_url(), name, signer._convert_query_string(qry_str))
+                # cache for 23 hours
+                timeout = 60*60*23
+	        cache.set(cache_key, val, timeout)
+	        return val
+            else:
+	        logger.info("url cache hit for %s" % name)
+                return val
+    	except Exception as ex:
+	    logger.error("shared access error %s" % ex)
+	    return None
 
     def modified_time(self, name):
         """
@@ -199,3 +242,7 @@ class AzureStorage(Storage):
                 '%a, %d %b %Y %H:%M:%S %Z')
         except WindowsAzureMissingResourceError:
             pass
+
+
+    def path(self, name):
+	return name
